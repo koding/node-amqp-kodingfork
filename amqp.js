@@ -152,8 +152,8 @@ function AMQPParser (version, type) {
     if (fh.used >= fh.length) {
       fh.read = 0;
       frameType = fh[fh.read++];
-      frameChannel = parseInt(fh, 2);
-      var frameSize = parseInt(fh, 4);
+      frameChannel = parseInteger(fh, 2, self);
+      var frameSize = parseInteger(fh, 4, self);
       fh.used = 0; // for reuse
       if (frameSize > maxFrameBuffer) {
         self.throwError("Oversized frame " + frameSize);
@@ -221,9 +221,9 @@ function AMQPParser (version, type) {
 }
 
 // If there's an error in the parser, call the onError handler or throw
-AMQPParser.prototype.throwError = function (error) {
-  if(this.onError) this.onError(error);
-  else throw new Error(error);
+AMQPParser.prototype.throwError = function (err) {
+  if(this.onError) this.onError(err);
+  else this.emit("error", err);
 };
 
 // Everytime data is recieved on the socket, pass it to this function for
@@ -237,7 +237,7 @@ AMQPParser.prototype.execute = function (data) {
 
 
 // parse Network Byte Order integers. size can be 1,2,4,8
-function parseInt (buffer, size) {
+function parseInteger (buffer, size, emitter) {
   var int = 0;
   switch (size) {
     case 1:
@@ -257,7 +257,7 @@ function parseInt (buffer, size) {
              (buffer[buffer.read++] << 8)  + buffer[buffer.read++];
 
     default:
-      throw new Error("cannot parse ints of that size");
+      emitError(emitter, "cannot parse ints of that size");
   }
 }
 
@@ -270,16 +270,16 @@ function parseShortString (buffer) {
 }
 
 
-function parseLongString (buffer) {
-  var length = parseInt(buffer, 4);
+function parseLongString (buffer, emitter) {
+  var length = parseInteger(buffer, 4, emitter);
   var s = buffer.slice(buffer.read, buffer.read + length);
   buffer.read += length;
   return s.toString();
 }
 
 
-function parseSignedInteger (buffer) {
-  var int = parseInt(buffer, 4);
+function parseSignedInteger (buffer, emitter) {
+  var int = parseInteger(buffer, 4, emitter);
   if (int & 0x80000000) {
     int |= 0xEFFFFFFF;
     int = -int;
@@ -287,17 +287,17 @@ function parseSignedInteger (buffer) {
   return int;
 }
 
-function parseValue (buffer) {
+function parseValue (buffer, emitter) {
   switch (buffer[buffer.read++]) {
     case AMQPTypes.STRING:
-      return parseLongString(buffer);
+      return parseLongString(buffer, emitter);
 
     case AMQPTypes.INTEGER:
-      return parseInt(buffer, 4);
+      return parseInteger(buffer, 4, emitter);
 
     case AMQPTypes.DECIMAL:
-      var dec = parseInt(buffer, 1);
-      var num = parseInt(buffer, 4);
+      var dec = parseInteger(buffer, 1, emitter);
+      var num = parseInteger(buffer, 4, emitter);
       return num / (dec * 10);
 
     case AMQPTypes._64BIT_FLOAT:
@@ -315,53 +315,53 @@ function parseValue (buffer) {
       return (new jspack(true)).Unpack('f', b);
 
     case AMQPTypes.TIME:
-      var int = parseInt(buffer, 8);
+      var int = parseInteger(buffer, 8, emitter);
       return (new Date()).setTime(int * 1000);
 
     case AMQPTypes.HASH:
-      return parseTable(buffer);
+      return parseTable(buffer, emitter);
 
     case AMQPTypes.SIGNED_64BIT:
-      return parseInt(buffer, 8);
+      return parseInteger(buffer, 8, emitter);
 
     case AMQPTypes.BOOLEAN:
-      return (parseInt(buffer, 1) > 0);
+      return (parseInteger(buffer, 1, emitter) > 0);
 
     case AMQPTypes.BYTE_ARRAY:
-      var len = parseInt(buffer, 4);
+      var len = parseInteger(buffer, 4, emitter);
       var buf = new Buffer(len);
       buffer.copy(buf, 0, buffer.read, buffer.read + len);
       buffer.read += len;
       return buf;
 
     case AMQPTypes.ARRAY:
-      var len = parseInt(buffer, 4);
+      var len = parseInteger(buffer, 4, emitter);
       var end = buffer.read + len;
       var arr = new Array();
 
       while (buffer.read < end) {
-        arr.push(parseValue(buffer));
+        arr.push(parseValue(buffer, emitter));
       }
 
       return arr;
 
     default:
-      throw new Error("Unknown field value type " + buffer[buffer.read-1]);
+      emitError(emitter,"Unknown field value type " + buffer[buffer.read-1]);
   }
 }
 
-function parseTable (buffer) {
-  var length = buffer.read + parseInt(buffer, 4);
+function parseTable (buffer, emitter) {
+  var length = buffer.read + parseInteger(buffer, 4, emitter);
   var table = {};
 
   while (buffer.read < length) {
-    table[parseShortString(buffer)] = parseValue(buffer);
+    table[parseShortString(buffer)] = parseValue(buffer, emitter);
   }
   
   return table;
 }
 
-function parseFields (buffer, fields) {
+function parseFields (buffer, fields, emitter) {
   var args = {};
 
   var bitIndex = 0;
@@ -394,16 +394,16 @@ function parseFields (buffer, fields) {
         break;
 
       case 'short':
-        value = parseInt(buffer, 2);
+        value = parseInteger(buffer, 2, emitter);
         break;
 
       case 'long':
-        value = parseInt(buffer, 4);
+        value = parseInteger(buffer, 4, emitter);
         break;
 
       case 'timestamp':
       case 'longlong':
-        value = parseInt(buffer, 8);
+        value = parseInteger(buffer, 8, emitter);
         break;
 
       case 'shortstr':
@@ -411,15 +411,15 @@ function parseFields (buffer, fields) {
         break;
 
       case 'longstr':
-        value = parseLongString(buffer);
+        value = parseLongString(buffer, emitter);
         break;
 
       case 'table':
-        value = parseTable(buffer);
+        value = parseTable(buffer, emitter);
         break;
 
       default:
-        throw new Error("Unhandled parameter type " + field.domain);
+        emitError(emitter,"Unhandled parameter type " + field.domain);
     }
     //debug("got " + value);
     args[field.name] = value;
@@ -431,8 +431,8 @@ function parseFields (buffer, fields) {
 
 AMQPParser.prototype._parseMethodFrame = function (channel, buffer) {
   buffer.read = 0;
-  var classId = parseInt(buffer, 2),
-     methodId = parseInt(buffer, 2);
+  var classId = parseInteger(buffer, 2, this),
+     methodId = parseInteger(buffer, 2, this);
 
   // Make sure that this is a method that we understand.
   if (!methodTable[classId] || !methodTable[classId][methodId]) {
@@ -444,7 +444,7 @@ AMQPParser.prototype._parseMethodFrame = function (channel, buffer) {
 
   if (!method) this.throwError("bad method?");
 
-  var args = parseFields(buffer, method.fields);
+  var args = parseFields(buffer, method.fields, this);
 
   if (this.onMethod) {
     this.onMethod(channel, method, args);
@@ -455,9 +455,9 @@ AMQPParser.prototype._parseMethodFrame = function (channel, buffer) {
 AMQPParser.prototype._parseHeaderFrame = function (channel, buffer) {
   buffer.read = 0;
 
-  var classIndex = parseInt(buffer, 2);
-  var weight = parseInt(buffer, 2);
-  var size = parseInt(buffer, 8);
+  var classIndex = parseInteger(buffer, 2, this);
+  var weight = parseInteger(buffer, 2, this);
+  var size = parseInteger(buffer, 8, this);
 
   var classInfo = classes[classIndex];
 
@@ -465,7 +465,7 @@ AMQPParser.prototype._parseHeaderFrame = function (channel, buffer) {
     this.throwError("TODO: support more than 15 properties");
   }
 
-  var propertyFlags = parseInt(buffer, 2);
+  var propertyFlags = parseInteger(buffer, 2, this);
 
   var fields = [];
   for (var i = 0; i < classInfo.fields.length; i++) {
@@ -474,14 +474,14 @@ AMQPParser.prototype._parseHeaderFrame = function (channel, buffer) {
     if (propertyFlags & (1 << (15-i))) fields.push(field);
   }
 
-  var properties = parseFields(buffer, fields);
+  var properties = parseFields(buffer, fields, this);
 
   if (this.onContentHeader) {
     this.onContentHeader(channel, classInfo, weight, properties, size);
   }
 };
 
-function serializeFloat(b, size, value, bigEndian) {
+function serializeFloat(b, size, value, bigEndian, emitter) {
   var jp = new jspack(bigEndian);
 
   switch(size) {
@@ -498,13 +498,13 @@ function serializeFloat(b, size, value, bigEndian) {
     break;
 
   default:
-    throw new Error("Unknown floating point size");
+    emitError(emitter,"Unknown floating point size");
   }
 }
 
-function serializeInt (b, size, int) {
+function serializeInt (b, size, int, emitter) {
   if (b.used + size > b.length) {
-    throw new Error("write out of bounds");
+    emitError(emitter, "write out of bounds");
   }
 
   // Only 4 cases - just going to be explicit instead of looping.
@@ -543,21 +543,21 @@ function serializeInt (b, size, int) {
       break;
 
     default:
-      throw new Error("Bad size");
+      emitError(emitter,"Bad size");
   }
 }
 
 
-function serializeShortString (b, string) {
+function serializeShortString (b, string, emitter) {
   if (typeof(string) != "string") {
-    throw new Error("param must be a string");
+    emitError(emitter,"param must be a string");
   }
   var byteLength = Buffer.byteLength(string, 'utf8');
   if (byteLength > 0xFF) {
-    throw new Error("String too long for 'shortstr' parameter");
+    emitError(emitter,"String too long for 'shortstr' parameter");
   }
   if (1 + byteLength + b.used >= b.length) {
-    throw new Error("Not enough space in buffer for 'shortstr'");
+    emitError(emitter,"Not enough space in buffer for 'shortstr'");
   }
   b[b.used++] = byteLength;
   b.write(string, b.used, 'utf8');
@@ -565,38 +565,38 @@ function serializeShortString (b, string) {
 }
 
 
-function serializeLongString (b, string) {
+function serializeLongString (b, string, emitter) {
   // we accept string, object, or buffer for this parameter.
   // in the case of string we serialize it to utf8.
   if (typeof(string) == 'string') {
     var byteLength = Buffer.byteLength(string, 'utf8');
-    serializeInt(b, 4, byteLength);
+    serializeInt(b, 4, byteLength, emitter);
     b.write(string, b.used, 'utf8');
     b.used += byteLength;
   } else if (typeof(string) == 'object') {
-    serializeTable(b, string);
+    serializeTable(b, string, emitter);
   } else {
     // data is Buffer
     var byteLength = string.length;
-    serializeInt(b, 4, byteLength);
+    serializeInt(b, 4, byteLength, emitter);
     b.write(string, b.used); // memcpy
     b.used += byteLength;
   }
 }
 
-function serializeDate(b, date) {
-  serializeInt(b, 8, date.valueOf() / 1000);
+function serializeDate(b, date, emitter) {
+  serializeInt(b, 8, date.valueOf() / 1000, emitter);
 }
 
-function serializeBuffer(b, buffer) {
-  serializeInt(b, 4, buffer.length);
+function serializeBuffer(b, buffer, emitter) {
+  serializeInt(b, 4, buffer.length, emitter);
   buffer.copy(b, b.used, 0);
   b.used += buffer.length;
 }
 
-function serializeBase64(b, buffer) {
-  serializeLongString(b, buffer.toString('base64'));
-}
+// function serializeBase64(b, buffer, emitter) {
+//   serializeLongString(b, buffer.toString('base64'), emitter);
+// }
 
 function isBigInt(value) {
   return value > 0xffffffff;
@@ -615,11 +615,11 @@ function isFloat(value)
   return value === +value && value !== (value|0);
 }
 
-function serializeValue (b, value) {
+function serializeValue (b, value, emitter) {
   switch (typeof(value)) {
     case 'string':
       b[b.used++] = 'S'.charCodeAt(0);
-      serializeLongString(b, value);
+      serializeLongString(b, value, emitter);
       break;
 
     case 'number':
@@ -627,16 +627,16 @@ function serializeValue (b, value) {
         if (isBigInt(value)) {
           // 64-bit uint
           b[b.used++] = 'l'.charCodeAt(0);
-          serializeInt(b, 8, value);
+          serializeInt(b, 8, value, emitter);
         } else {
           //32-bit uint
           b[b.used++] = 'I'.charCodeAt(0);
-          serializeInt(b, 4, value);
+          serializeInt(b, 4, value, emitter);
         }
       } else {
         //64-bit float
         b[b.used++] = 'd'.charCodeAt(0);
-        serializeFloat(b, 8, value);
+        serializeFloat(b, 8, value, false, emitter);
       }
       break;
 
@@ -648,25 +648,25 @@ function serializeValue (b, value) {
     default:
     if (value instanceof Date) {
       b[b.used++] = 'T'.charCodeAt(0);
-      serializeDate(b, value);
+      serializeDate(b, value, emitter);
     } else if (value instanceof Buffer) {
       b[b.used++] = 'x'.charCodeAt(0);
-      serializeBuffer(b, value);
+      serializeBuffer(b, value, emitter);
     } else if (util.isArray(value)) {
       b[b.used++] = 'A'.charCodeAt(0);
-      serializeArray(b, value);
+      serializeArray(b, value, emitter);
     } else if (typeof(value) === 'object') {
       b[b.used++] = 'F'.charCodeAt(0);
-      serializeTable(b, value);
+      serializeTable(b, value, emitter);
     } else {
       this.throwError("unsupported type in amqp table: " + typeof(value));
     }
   }
 }
 
-function serializeTable (b, object) {
+function serializeTable (b, object, emitter) {
   if (typeof(object) != "object") {
-    throw new Error("param must be an object");
+    emitError(emitter, "param must be an object");
   }
 
   // Save our position so that we can go back and write the length of this table
@@ -677,17 +677,17 @@ function serializeTable (b, object) {
 
   for (var key in object) {
     if (!object.hasOwnProperty(key)) continue;
-    serializeShortString(b, key);
-    serializeValue(b, object[key]);
+    serializeShortString(b, key, emitter);
+    serializeValue(b, object[key], emitter);
   }
 
   var endIndex = b.used;
   b.used = lengthIndex;
-  serializeInt(b, 4, endIndex - startIndex);
+  serializeInt(b, 4, endIndex - startIndex, emitter);
   b.used = endIndex;
 }
 
-function serializeArray (b, arr) {
+function serializeArray (b, arr, emitter) {
   // Save our position so that we can go back and write the byte length of this array
   // at the beginning of the packet (once we have serialized all elements).
   var lengthIndex = b.used;
@@ -696,16 +696,21 @@ function serializeArray (b, arr) {
 
   len = arr.length;
   for (var i = 0; i < len; i++) {
-    serializeValue(b, arr[i]);
+    serializeValue(b, arr[i], emitter);
   }
 
   var endIndex = b.used;
   b.used = lengthIndex;
-  serializeInt(b, 4, endIndex - startIndex);
+  serializeInt(b, 4, endIndex - startIndex, emitter);
   b.used = endIndex;
 }
 
-function serializeFields (buffer, fields, args, strict) {
+function emitError(emitter, message) {
+  err = "string" == typeof message ? new Error(message) : message;
+  emitter.emit("error", err);
+}
+
+function serializeFields (buffer, fields, args, strict, emitter) {
   var bitField = 0;
   var bitIndex = 0;
   for (var i = 0; i < fields.length; i++) {
@@ -713,7 +718,7 @@ function serializeFields (buffer, fields, args, strict) {
     var domain = field.domain;
     if (!(field.name in args)) {
       if (strict) {
-        throw new Error("Missing field '" + field.name + "' of type '" + domain + "' while executing AMQP method '" + arguments.callee.caller.arguments[1].name + "'");
+        emitError(emitter, "Missing field '" + field.name + "' of type '" + domain + "' while executing AMQP method '" + arguments.callee.caller.arguments[1].name + "'");
       }
       continue;
     }
@@ -725,7 +730,7 @@ function serializeFields (buffer, fields, args, strict) {
     switch (domain) {
       case 'bit':
         if (typeof(param) != "boolean") {
-          throw new Error("Unmatched field " + JSON.stringify(field));
+          emitError(emitter, "Unmatched field " + JSON.stringify(field));
         }
 
         if (param) bitField |= (1 << bitIndex);
@@ -741,50 +746,50 @@ function serializeFields (buffer, fields, args, strict) {
 
       case 'octet':
         if (typeof(param) != "number" || param > 0xFF) {
-          throw new Error("Unmatched field " + JSON.stringify(field));
+          emitError(emitter, "Unmatched field " + JSON.stringify(field));
         }
         buffer[buffer.used++] = param;
         break;
 
       case 'short':
         if (typeof(param) != "number" || param > 0xFFFF) {
-          throw new Error("Unmatched field " + JSON.stringify(field));
+          emitError(emitter, "Unmatched field " + JSON.stringify(field));
         }
-        serializeInt(buffer, 2, param);
+        serializeInt(buffer, 2, param, emitter);
         break;
 
       case 'long':
         if (typeof(param) != "number" || param > 0xFFFFFFFF) {
-          throw new Error("Unmatched field " + JSON.stringify(field));
+          emitError(emitter, "Unmatched field " + JSON.stringify(field));
         }
-        serializeInt(buffer, 4, param);
+        serializeInt(buffer, 4, param, emitter);
         break;
 
       case 'timestamp':
       case 'longlong':
-        serializeInt(buffer, 8, param);
+        serializeInt(buffer, 8, param, emitter);
         break;
 
       case 'shortstr':
         if (typeof(param) != "string" || param.length > 0xFF) {
-          throw new Error("Unmatched field " + JSON.stringify(field));
+          emitError(emitter, "Unmatched field " + JSON.stringify(field));
         }
-        serializeShortString(buffer, param);
+        serializeShortString(buffer, param, emitter);
         break;
 
       case 'longstr':
-        serializeLongString(buffer, param);
+        serializeLongString(buffer, param, emitter);
         break;
 
       case 'table':
         if (typeof(param) != "object") {
-          throw new Error("Unmatched field " + JSON.stringify(field));
+          emitError(emitter, "Unmatched field " + JSON.stringify(field));
         }
-        serializeTable(buffer, param);
+        serializeTable(buffer, param, emitter);
         break;
 
       default:
-        throw new Error("Unknown domain value type " + domain);
+        emitError(emitter, "Unknown domain value type " + domain);
     }
   }
 }
@@ -984,12 +989,12 @@ var defaultOptions = { host: 'localhost'
 // reestablished.
 var defaultImplOptions = { defaultExchangeName: '', reconnect: true , reconnectBackoffStrategy: 'linear' , reconnectExponentialLimit: 120000, reconnectBackoffTime: 1000 };
 
-function urlOptions(connectionString) {
+function urlOptions(connectionString, emitter) {
   var opts = {};
   var url = URL.parse(connectionString);
   var scheme = url.protocol.substring(0, url.protocol.lastIndexOf(':'));
   if (scheme != 'amqp' && scheme != 'amqps') {
-    throw new Error('Connection URI must use amqp or amqps scheme. ' +
+    emitError(emitter,'Connection URI must use amqp or amqps scheme. ' +
                     'For example, "amqp://bus.megacorp.internal:5766".');
   }
   opts.ssl = ('amqps' === scheme);
@@ -1016,7 +1021,7 @@ exports.createConnection = function (connectionArgs, options, readyCallback) {
 
 Connection.prototype.setOptions = function (options) {
   var o  = {};
-  var urlo = (options && options.url) ? urlOptions(options.url) : {};
+  var urlo = (options && options.url) ? urlOptions(options.url, this) : {};
   mixin(o, defaultOptions, urlo, options || {});
   this.options = o;
 };
@@ -1067,7 +1072,7 @@ Connection.prototype._onMethod = function (channel, method, args) {
       return;
     }
     if (!this.channels[channel]._onChannelMethod) {
-      throw new Error('Channel ' + channel + ' has no _onChannelMethod method.');
+      emitError(this, 'Channel ' + channel + ' has no _onChannelMethod method.');
     }
     this.channels[channel]._onChannelMethod(channel, method, args);
     return;
@@ -1134,14 +1139,14 @@ Connection.prototype._onMethod = function (channel, method, args) {
     case methods.connectionClose:
       var e = new Error(args.replyText);
       e.code = args.replyCode;
-      if (!this.listeners('close').length) {
+      if (!this.listeners('close').length && !this.implOptions.reconnect) {
         console.log('Unhandled connection error: ' + args.replyText);
       }
       this.destroy(e);
       break;
 
     default:
-      throw new Error("Uncaught method '" + method.name + "' with args " +
+      emitError(this, "Uncaught method '" + method.name + "' with args " +
           JSON.stringify(args));
   }
 };
@@ -1173,7 +1178,7 @@ Connection.prototype._inboundHeartbeatTimerReset = function () {
     var self = this;
     var gracePeriod = 2 * this.options.heartbeat;
     this._inboundHeartbeatTimer = setTimeout(function () {
-      self.emit('error', new Error('no heartbeat or data in last ' + gracePeriod + ' seconds'));
+      emitError(self, 'no heartbeat or data in last ' + gracePeriod + ' seconds');
     }, gracePeriod * 1000);
   }
 };
@@ -1185,25 +1190,25 @@ Connection.prototype._sendMethod = function (channel, method, args) {
 
   b[b.used++] = 1; // constants.frameMethod
 
-  serializeInt(b, 2, channel);
+  serializeInt(b, 2, channel, this);
 
   var lengthIndex = b.used;
 
-  serializeInt(b, 4, 42); // replace with actual length.
+  serializeInt(b, 4, 42, this); // replace with actual length.
 
   var startIndex = b.used;
 
 
-  serializeInt(b, 2, method.classIndex); // short, classId
-  serializeInt(b, 2, method.methodIndex); // short, methodId
+  serializeInt(b, 2, method.classIndex, this); // short, classId
+  serializeInt(b, 2, method.methodIndex, this); // short, methodId
 
-  serializeFields(b, method.fields, args, true);
+  serializeFields(b, method.fields, args, true, this);
 
   var endIndex = b.used;
 
   // write in the frame length now that we know it.
   b.used = lengthIndex;
-  serializeInt(b, 4, endIndex - startIndex);
+  serializeInt(b, 4, endIndex - startIndex, this);
   b.used = endIndex;
 
   b[b.used++] = 206; // constants.frameEnd;
@@ -1246,19 +1251,19 @@ function sendHeader (connection, channel, size, properties) {
 
   b[b.used++] = 2; // constants.frameHeader
 
-  serializeInt(b, 2, channel);
+  serializeInt(b, 2, channel, connection);
 
   var lengthStart = b.used;
 
-  serializeInt(b, 4, 0 /*dummy*/); // length
+  serializeInt(b, 4, 0 /*dummy*/, connection); // length
 
   var bodyStart = b.used;
 
   // HEADER'S BODY
 
-  serializeInt(b, 2, classInfo.index);   // class 60 for Basic
-  serializeInt(b, 2, 0);                 // weight, always 0 for rabbitmq
-  serializeInt(b, 8, size);              // byte size of body
+  serializeInt(b, 2, classInfo.index, connection);   // class 60 for Basic
+  serializeInt(b, 2, 0, connection);                 // weight, always 0 for rabbitmq
+  serializeInt(b, 8, size, connection);              // byte size of body
 
   // properties - first propertyFlags
   var props = {'contentType': 'application/octet-stream'};
@@ -1267,9 +1272,9 @@ function sendHeader (connection, channel, size, properties) {
   for (var i = 0; i < classInfo.fields.length; i++) {
     if (props[classInfo.fields[i].name]) propertyFlags |= 1 << (15-i);
   }
-  serializeInt(b, 2, propertyFlags);
+  serializeInt(b, 2, propertyFlags, connection);
   // now the actual properties.
-  serializeFields(b, classInfo.fields, props, false);
+  serializeFields(b, classInfo.fields, props, false, connection);
 
   //serializeTable(b, props);
 
@@ -1277,7 +1282,7 @@ function sendHeader (connection, channel, size, properties) {
 
   // Go back to the header and write in the length now that we know it.
   b.used = lengthStart;
-  serializeInt(b, 4, bodyEnd - bodyStart);
+  serializeInt(b, 4, bodyEnd - bodyStart, connection);
   b.used = bodyEnd;
 
   // 1 OCTET END
@@ -1325,8 +1330,8 @@ Connection.prototype._sendBody = function (channel, body, properties) {
       var b = new Buffer(7);
       b.used = 0;
       b[b.used++] = 3; // constants.frameBody
-      serializeInt(b, 2, channel);
-      serializeInt(b, 4, fragmentLength);
+      serializeInt(b, 2, channel, this);
+      serializeInt(b, 4, fragmentLength, this);
 
       this.write(b);
       this.write(body.slice(offset,offset+fragmentLength));
@@ -1451,7 +1456,7 @@ Message.prototype.acknowledge = function (all) {
   this.queue.connection._sendMethod(this.queue.channel, methods.basicAck,
       { reserved1: 0
       , deliveryTag: this.deliveryTag
-      , multiple: all ? true : false
+      , multiple: !!all
       });
 };
 
@@ -1460,7 +1465,7 @@ Message.prototype.acknowledge = function (all) {
 Message.prototype.reject = function (requeue){
   this.queue.connection._sendMethod(this.queue.channel, methods.basicReject,
       { deliveryTag: this.deliveryTag
-      , requeue: requeue ? true : false
+      , requeue: !!requeue
       });
 }
 
@@ -1476,6 +1481,10 @@ function Channel (connection, channel) {
   this.reconnect();
 }
 util.inherits(Channel, events.EventEmitter);
+
+Channel.prototype.closeOK = function() {
+    this.connection._sendMethod(this.channel, methods.channelCloseOk, {reserved1: ""});
+}
 
 Channel.prototype.reconnect = function () {
   this.connection._sendMethod(this.channel, methods.channelOpen, {reserved1: ""});
@@ -1535,13 +1544,25 @@ Channel.prototype._onChannelMethod = function(channel, method, args) {
     }
 }
 
-Channel.prototype.close = function() { 
-  this.state = 'closing';
+Channel.prototype.close = function() {
+    this.state = 'closing';
     this.connection._sendMethod(this.channel, methods.channelClose,
                                 {'replyText': 'Goodbye from node',
                                  'replyCode': 200,
                                  'classId': 0,
                                  'methodId': 0});
+}
+
+function closeChannelHelper(inst, consumerTag) {
+  return function () {
+    if (inst.options.closeChannelOnUnsubscribe) {
+      inst.close();
+    }
+    if (consumerTag != null) {
+      delete inst.consumerTagListeners[consumerTag];
+      delete inst.consumerTagOptions[consumerTag];
+    }
+  };
 }
 
 function Queue (connection, channel, name, options, callback) {
@@ -1612,13 +1633,7 @@ Queue.prototype.unsubscribe = function(consumerTag) {
                                   consumerTag: consumerTag,
                                   noWait: false });
   })
-  .addCallback(function () {
-    if(self.options.closeChannelOnUnsubscribe){
-      self.close();
-    }
-    delete self.consumerTagListeners[consumerTag];
-    delete self.consumerTagOptions[consumerTag];
-  });
+  .addCallback(closeChannelHelper(self, consumerTag));
 };
 
 Queue.prototype.subscribe = function (/* options, messageListener */) {
@@ -1854,7 +1869,8 @@ Queue.prototype.destroy = function (options) {
         , noWait: false
         , "arguments": {}
     });
-  });
+  })
+  .addCallback(closeChannelHelper(self)); //TODO: test commenting this out.
 };
 
 Queue.prototype.purge = function() {
@@ -1944,6 +1960,7 @@ Queue.prototype._onMethod = function (channel, method, args) {
 
     case methods.channelClose:
       this.state = "closed";
+      this.closeOK()
       this.connection.queueClosed(this.name);
       var e = new Error(args.replyText);
       e.code = args.replyCode;
@@ -1964,7 +1981,7 @@ Queue.prototype._onMethod = function (channel, method, args) {
       break;
 
     default:
-      throw new Error("Uncaught method '" + method.name + "' with args " +
+      emitError(this, "Uncaught method '" + method.name + "' with args " +
           JSON.stringify(args) + "; tasks = " + JSON.stringify(this._tasks));
   }
 
@@ -2047,10 +2064,10 @@ Exchange.prototype._onMethod = function (channel, method, args) {
             , reserved3:  false
             , exchange:   this.name
             , type:       this.options.type || 'topic'
-            , passive:    this.options.passive    ? true : false
-            , durable:    this.options.durable    ? true : false
-            , autoDelete: this.options.autoDelete ? true : false
-            , internal:   this.options.internal   ? true : false
+            , passive:    !!this.options.passive
+            , durable:    !!this.options.durable
+            , autoDelete: !!this.options.autoDelete
+            , internal:   !!this.options.internal
             , noWait:     false
             , "arguments":this.options.arguments || {}
             });
@@ -2075,6 +2092,15 @@ Exchange.prototype._onMethod = function (channel, method, args) {
 
       break;
 
+    case methods.exchangeBindOk:
+      if (this._bindCallback) {
+        // setting this._bindCallback to null before calling the callback allows for a subsequent bind within the callback
+        var cb = this._bindCallback;
+        this._bindCallback = null;
+        cb(this);
+      }
+      break;
+
     case methods.confirmSelectOk:
       this._sequence = 1;
       
@@ -2088,6 +2114,7 @@ Exchange.prototype._onMethod = function (channel, method, args) {
 
     case methods.channelClose:
       this.state = "closed";
+      this.closeOK();
       this.connection.exchangeClosed(this.name);
       var e = new Error(args.replyText);
       e.code = args.replyCode;
@@ -2131,13 +2158,51 @@ Exchange.prototype._onMethod = function (channel, method, args) {
       break;
 
     default:
-      throw new Error("Uncaught method '" + method.name + "' with args " +
+      emitError(this, "Uncaught method '" + method.name + "' with args " +
           JSON.stringify(args));
   }
 
   this._tasksFlush();
 };
 
+Exchange.prototype.bind = function (exchange, routingKey, callback) {
+  var self = this;
+
+  if(callback) this._bindCallback = callback;
+
+  var exchangeName = exchange instanceof Exchange ? exchange.name : exchange;
+
+  if(exchangeName in self.connection.exchanges) {
+    this.exchange = self.connection.exchanges[exchangeName];
+    this.exchange.binds++;
+  }
+
+  self.connection._sendMethod(self.channel, methods.exchangeBind,
+      { reserved1: 0
+      , destination: self.name
+      , source: exchangeName
+      , routingKey: routingKey
+      , noWait: false
+      , "arguments": {}
+      });
+
+};
+
+Exchange.prototype.unbind = function (exchange, routingKey) {
+  var self = this;
+
+  return this._taskPush(methods.exchangeUnbindOk, function () {
+    var exchangeName = exchange instanceof Exchange ? exchange.name : exchange;
+    self.connection._sendMethod(self.channel, methods.exchangeUnbind,
+        { reserved1: 0
+        , destination: self.name
+        , source: exchangeName
+        , routingKey: routingKey
+        , noWait: false
+        , "arguments": {}
+        });
+  });
+};
 
 // exchange.publish('routing.key', 'body');
 //
